@@ -13,7 +13,6 @@ from utils import ValidRequestExceptions
 async def check_header_request_data(request: 'Request', handler: Callable) -> Any:
 
     if request.headers.get('Content-Type') == 'application/json':
-
         try:
 
             response = await handler(request)

@@ -1,4 +1,4 @@
-from asyncio import create_task, Lock, Event, get_event_loop, CancelledError, sleep
+from asyncio import Lock, get_event_loop, CancelledError, sleep, create_task, gather, Condition
 from datetime import datetime
 from traceback import print_exc
 
@@ -16,32 +16,33 @@ def add_self_route(app: 'web.Application') -> 'web.Application':
 
 
 async def on_shutdown(app: 'web.Application'):
-    print(f'= Exited with asyncio.ancelledError. Cancelled Task: =\n{[t for t in app["queue"]]}')
+    print(f'= Exited | Cancelled Task:'
+          f'=\n{[t for t in app["task_in_pending"] + app["task_in_process"]]}')
     await app.cleanup()
     app.clear()
 
 
-async def handle_tasks(app: 'web.Application'):
-    try:
-        while True:
-            print('on_startup queue and wait')
-            await app['start_queue'].wait()
+async def worker(app: 'web.Application', worker: int):
+    while True:
+        try:
+            while True:
+                async with app['task_in_pending_lock']:
+                    task = app['task_in_pending'].pop(0)
 
-            while app['pending_task']:
-                # Set a gather and declare func(below actions) for parallel work
-                async with app['pending_task_lock']:
-                    app['pending_task'][0]['state'] = 'process'
-                    app['pending_task'][0]['date_of_start'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                async with app['task_in_process_lock']:
+                    app['task_in_process'].append(task)
 
-                    n = app['pending_task'][0].get('N')
-                    n1 = app['pending_task'][0].get('N1')
-                    d = app['pending_task'][0].get('D')
-                    interval = app['pending_task'][0].get('interval')
+                task['state'] = 'process'
+                task['date_of_start'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                n = task.get('N')
+                n1 = task.get('N1')
+                d = task.get('D')
+                interval = task.get('interval')
 
                 try:
                     for i in range(n1, n1 + n):
-                        async with app['pending_task_lock']:
-                            app['pending_task'][0]['current_value'] = n1 + (i - 1) * d
+                        async with app['task_in_process_lock']:
+                            task['current_value'] = n1 + (i - 1) * d
                             await sleep(interval)
 
                 except CancelledError:
@@ -49,31 +50,38 @@ async def handle_tasks(app: 'web.Application'):
                 except Exception:
                     print(print_exc())
 
-                app['start_queue'].clear()
-                async with app['pending_task_lock']:
-                    app['pending_task'].pop(0)
+                async with app['task_in_process_lock']:
+                    app['task_in_process'].remove(task)
 
-                    for task in app['pending_task']:
-                        task['number'] -= 1
+        except IndexError:
+            print("Queue is empty from", worker)
+            async with app['process_queue']:
+                await app['process_queue'].wait()
 
-    except CancelledError:
-        pass
-    except Exception as e:
-        print(print_exc())
+
+async def create_workers_for_handle_tasks(app: 'web.Application'):
+    await gather(*[worker(app, worker=num) for num in range(0, app['number_of_queues'])])
 
 
 async def on_startup(app: 'web.Application'):
-    app['handle_task'] = create_task(handle_tasks(app))
+    app['gather_with_queues'] = create_task(create_workers_for_handle_tasks(app))
 
 
 async def setup_server() -> 'web.Application':
     app = web.Application(middlewares=[check_header_request_data])
 
     app = add_self_route(app)
+    app['number_of_queues'] = 5  # Set it
+    app['process_queue'] = Condition()
 
-    app['pending_task'] = []
-    app['pending_task_lock'] = Lock()
-    app['start_queue'] = Event()
+    app['task_in_process'] = []
+    app['task_in_process_lock'] = Lock()
+
+    app['task_in_pending'] = []
+    app['task_in_pending_lock'] = Lock()
+
+    app['counter_tasks'] = 0
+    app['counter_tasks_lock'] = Lock()
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
